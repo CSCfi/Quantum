@@ -11,7 +11,7 @@ from qiskit.result import CorrelatedReadoutMitigator
 import scipy.linalg as la
 
 class Learning:
-	def __init__(self, ansatz, backend, hamiltonian, estimator, optimizer: List[float]) -> None:
+	def __init__(self, ansatz, backend, hamiltonian, estimator, optimizer: List[float], layout) -> None:
 		self.optimizer = optimizer
 		self.backend = backend
 		self.seed = None
@@ -32,6 +32,7 @@ class Learning:
 		self.result = None
 		self.shots = None
 		self.cost_function = None
+		self.layout = layout
         
 		self.costs_dictionary = {
             "params": None,
@@ -48,9 +49,11 @@ class Learning:
 	        ) -> dict:
 		optimizer = self.optimizer
 		self.num_params = self.ansatz.num_parameters
-		self.x0 = np.random.normal(0, 0.01, self.ansatz.num_parameters) 
+		rng = np.random.default_rng()
+		self.x0 = rng.normal(0, 0.01, self.ansatz.num_parameters)
+		# self.x0 = np.random.normal(0, 0.01, self.ansatz.num_parameters)  # legacy generator method
 		self.bounds = [(-np.pi, np.pi)] * self.num_params
-		self.min_kwargs = min_kwargs if min_kwargs else dict()
+		self.min_kwargs = min_kwargs if min_kwargs else {}
 		self.cost_function = self.energy_cost_function
 
 		if optimizer == 'dual_annealing':
@@ -65,49 +68,45 @@ class Learning:
 			self.result = minimize(self.cost_function, self.x0, method='BFGS', tol=1e-5, options={"maxiter": 5000})
 		elif optimizer == 'SPSA':
 			# SPSA with possible decaying perturbation and learning rate
-			def two_phase_lr(a0 = 0.0000002, a1=0.02, a2=0.02, switch_iter1=3, switch_iter2=70):
+			def sc_generator(values: list, switch_points:list, total_iters:int=100):
 				def generator():
-					for k in range(100): 
-						if k < switch_iter1:
-							yield a0
-						elif k > switch_iter1 and k < switch_iter2:
-							yield a1
+					for k in range(total_iters):
+						if k < switch_points[0]:
+							yield values[0]
+						elif k < switch_points[1]:
+							yield values[1]
 						else:
-							yield a2
+							yield values[2]
 				return generator
+			
+			def two_phase_learning_rate(a0:float, a1:float, a2:float, switch_iter1:int, switch_iter2:int):
+				return sc_generator([a0, a1, a2], [switch_iter1, switch_iter2])
+			def two_phase_pertubation(c0:float, c1:float, c2:float, switch_iter1:int, switch_iter2:int):
+				return sc_generator([c0, c1, c2], [switch_iter1, switch_iter2])
 
-			def two_phase_pert(c0 = 0.0000001, c1=0.3, c2=0.3, switch_iter1=3, switch_iter2=70):
-				def generator():
-					for k in range(100): 
-						if k < switch_iter1:
-							yield c0
-						elif k > switch_iter1 and k < switch_iter2:
-							yield c1
-						else:
-							yield c2
-				return generator
 			spsa = SPSA(
 				maxiter=75,
-				learning_rate=two_phase_lr(a0 = 0.00000002, a1=0.02, a2=0.02, switch_iter1 = 3, switch_iter2=70),
-				perturbation=two_phase_pert(c0 = 0.00000001, c1=0.3, c2=0.3, switch_iter1 = 3, switch_iter2=70))
+				learning_rate=two_phase_learning_rate(a0 = 0.00000002, a1=0.02, a2=0.02, switch_iter1 = 3, switch_iter2=70),
+				perturbation=two_phase_pertubation(c0 = 0.00000001, c1=0.3, c2=0.3, switch_iter1 = 3, switch_iter2=70))
 			self.result = spsa.minimize(self.cost_function, self.x0)
 		elif optimizer == 'SPSA2':
 			spsa = SPSA(maxiter=100)
 			self.result = spsa.minimize(self.cost_function, self.x0)
 
 			self.params = self.result.x
-			return dict(
-				n=self.n,
-				iter=self.iter,
-				nfev=self.nfev,
-				cost=self.cost,
-				params=self.params,
-				ansatz=self.ansatz,
-				optimizer=self.optimizer.__class__.__name__,
-				min_kwargs=self.min_kwargs,
-				shots=self.shots)
+			return {
+                    "n": self.n,
+                    "iter": self.iter,
+                    "nfev": self.nfev,
+                    "cost": self.cost,
+                    "params": self.params,
+                    "ansatz": self.ansatz,
+                    "optimizer": self.optimizer.__class__.__name__,
+                    "min_kwargs": self.min_kwargs,
+                    "shots": self.shots,
+                }
 
-	# Defining count filtering function
+	@staticmethod
 	def filter_counts_by_particle_number(counts: Counts, target_particles: int) -> Counts:
 		filtered_counts = {
 			bitstr: count for bitstr, count in counts.items()
@@ -116,8 +115,7 @@ class Learning:
 		total = sum(filtered_counts.values())
 		if total == 0:
 			raise ValueError("No bitstrings matched the target particle number.")
-		original_total = sum(filtered_counts.values())
-		probabilities = {bitstr: count/original_total for bitstr, count in filtered_counts.items()}
+		probabilities = {bitstr: count/total for bitstr, count in filtered_counts.items()}
 		
 		scaled_counts = {}
 		remainders = []
@@ -134,6 +132,8 @@ class Learning:
 		
 		return scaled_counts
 	
+
+	@staticmethod
 	def calibration_circuits(num_qubits):
 		circuits = []
 		for i in range(2**num_qubits):
@@ -148,10 +148,12 @@ class Learning:
 			circuits.append(qc)
             
 		return circuits
+	
 
+	@staticmethod
 	def mitigation_matrix(calibration_results, num_qubits):
 		num_states = 2**num_qubits
-		M = np.zeros((num_states, num_states))
+		matrix = np.zeros((num_states, num_states))
             
 		for state_index in range(num_states):
 			counts = calibration_results.get_counts(state_index)
@@ -159,17 +161,18 @@ class Learning:
                 
 			for measured_state, count in counts.items():
 				measured_state_index = int(measured_state, 2)
-				M[measured_state_index, state_index] = count / total_shots
+				matrix[measured_state_index, state_index] = count / total_shots
             
-		return M
-
-	def mitigate_counts(noisy_counts, Minv, num_qubits, shots):
+		return matrix
+	
+	@staticmethod
+	def mitigate_counts(noisy_counts, minv, num_qubits, shots):
 		counts_vector = np.zeros(2**num_qubits)
 		for state, count in noisy_counts.items():
 			index = int(state, 2)
 			counts_vector[index] = count
             
-		mitigated_vector = np.dot(Minv, counts_vector)
+		mitigated_vector = np.dot(minv, counts_vector)
             
 		mitigated_vector = np.maximum(mitigated_vector, 0)
 		mitigated_vector = mitigated_vector * shots / np.sum(mitigated_vector)
@@ -181,37 +184,56 @@ class Learning:
             
 		return mitigated_counts
 
-	backend = fake_aphrodite.IQMFakeAphrodite()
-	num_qubits = 6
-	shots = 10000
+	@property
+	def calibration_matrix(self):
+		"""
+		Returns the calibration matrix (and computes it if needed).
+		"""
+		if not hasattr(self, "_calibration_matrix"):
+			self._compute_calibration_matrix()
+		return self._calibration_matrix
 
-	# Generating and running calibration circuits
-	calibration_circuits_1 = calibration_circuits(num_qubits)
-	calibration_circuits = transpile(calibration_circuits_1, backend=backend, initial_layout=[4,5,6,10,11,12], optimization_level=3) 
-	calibration_job = backend.run(calibration_circuits, shots=shots)
-	calibration_results = calibration_job.result()
-	print(calibration_results.get_counts())
 
-	# Building mitigation matrix
-	M = mitigation_matrix(calibration_results, num_qubits)
-	print("Calibration matrix M:")
-	print(M)
-    
-	# Calculating inverse matrix
-	Minv = la.inv(M)
-	print("Inverse matrix Minv:")
-	print(Minv)
+	def _compute_calibration_matrix(self):
+		"""
+		Builds and stores the calibration matrix
+		"""
+		backend = fake_aphrodite.IQMFakeAphrodite()
+		num_qubits = 6
+		shots = 10000
+
+		# Generating and running calibration circuits
+		calibration_circuits_1 = self.calibration_circuits(num_qubits)
+		calibration_circuits = transpile(
+			calibration_circuits_1,
+			backend=backend,
+			initial_layout=self.layout,
+			optimization_level=3
+		) 
+		calibration_job = backend.run(calibration_circuits, shots=shots)
+		calibration_results = calibration_job.result()
+
+		# Build calibration matrix
+		self._calibration_matrix = self.mitigation_matrix(calibration_results, num_qubits)
+		print("\nCalibration matrix:\n", self._calibration_matrix)
+
+		# Calculate and print inverse matrix
+		inverse_matrix = la.inv(self._calibration_matrix)
+		print("\nInverse matrix:\n", inverse_matrix)
+
+
 
 	def energy_cost_function(self, x: List[float]) -> float:	
 		self.params = x
+		calibration_matrix = self.calibration_matrix
 		
 		# Compiling with Qiskit to backend and binding parameters
 		values = self.params
 		bound_circuit = self.ansatz.assign_parameters(values)
 		bound_circuit.measure_all()
-		transpiled_job = transpile(bound_circuit, backend=self.backend, initial_layout=[4,5,6,10,11,12], optimization_level=3)
+		transpiled_job = transpile(bound_circuit, backend=self.backend, initial_layout=self.layout, optimization_level=3)
     
-		mitigator = CorrelatedReadoutMitigator(self.M, qubits=[4,5,6,10,11,12])
+		mitigator = CorrelatedReadoutMitigator(calibration_matrix, qubits=self.layout)
         
 		def is_diagonal(pauli_str):
 			return all(p in {'I', 'Z'} for p in pauli_str)
