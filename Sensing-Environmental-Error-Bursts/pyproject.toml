@@ -1,0 +1,12 @@
+[project]
+name = "blog-text"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "iqm-client[qiskit]==34.0.3",
+    "matplotlib>=3.11.1",
+    "notebook>=7.6.1",
+    "pylatexenc>=2.11",
+]
